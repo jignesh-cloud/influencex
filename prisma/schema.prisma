@@ -1,0 +1,610 @@
+// Group 8A Creator Sourcing & Campaign Platform
+// Prisma schema — Phase 2: full data model.
+//
+// Three independent decision axes (do not merge, see architecture doc §1):
+//   1. ClientPreference.preference   — client feedback only, never authoritative
+//   2. CampaignCreator.campaignDecision — Group 8A's official per-campaign call
+//   3. Creator.globalEligibilityStatus — permanent, campaign-independent, manual-only
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum UserRole {
+  admin
+  team_member
+}
+
+enum CampaignStatus {
+  draft
+  active
+  completed
+}
+
+enum CompensationType {
+  gifting_only
+  commission_only
+  flat_fee
+  flat_fee_plus_commission
+}
+
+/// Conceptual pipeline stage. Derived/driven by CampaignCreator.campaignDecision
+/// plus compensationType — see CampaignWorkflowService (src/features/campaigns/workflow.ts).
+enum WorkflowStatus {
+  sourced
+  pending_internal_review
+  shortlisted
+  sent_to_client
+  client_feedback_received
+  group8a_review
+  ready_for_outreach
+  invite_created
+  invite_sent
+  affiliate_application_pending
+  enrolled_active
+  approved_complete
+  declined_for_campaign
+  kept_pending
+}
+
+/// Group 8A's official, campaign-scoped decision. THIS drives workflowStatus.
+/// Never let ClientPreference or GlobalEligibilityStatus set this directly.
+enum CampaignDecision {
+  accept_for_campaign
+  decline_for_campaign
+  keep_pending
+}
+
+enum FlatFeePaymentStatus {
+  unpaid
+  paid
+}
+
+enum UsageRightsGranted {
+  yes
+  no
+  negotiable
+}
+
+/// Permanent, campaign-independent creator state. Only ever changed via
+/// blockCreatorGlobally() / unblockCreatorGlobally() — grep those names
+/// before adding any other write path to this field.
+enum GlobalEligibilityStatus {
+  eligible_for_future_campaigns
+  unfit_globally_blocked
+}
+
+enum GlobalBlockReason {
+  inappropriate_or_offensive_content
+  fraudulent_followers_or_engagement
+  brand_safety_concern
+  unprofessional_conduct
+  previous_campaign_issue
+  legal_or_compliance_concern
+  do_not_contact
+  other
+}
+
+/// Client feedback only — never changes workflow status, never an official
+/// accept/decline, never a global block trigger.
+enum ClientPreferenceValue {
+  interested
+  pass_for_campaign
+  negotiating
+}
+
+enum AffiliateNetwork {
+  impact
+  awin
+  avantlink
+}
+
+enum AffiliateEnrollmentStatus {
+  invite_created
+  invited
+  applied
+  enrolled
+  inactive
+}
+
+enum InviteEmailStatus {
+  sent
+  failed
+  bounced
+}
+
+enum SavedViewPageScope {
+  campaign_dashboard
+  all_campaign_dashboards
+  creator_directory
+}
+
+enum ActivityActorType {
+  user
+  system
+  external_reviewer
+}
+
+// ---------------------------------------------------------------------------
+// Auth (Auth.js / NextAuth v5 Prisma adapter shape) + business User fields
+// ---------------------------------------------------------------------------
+
+model User {
+  id            String    @id @default(cuid())
+  name          String
+  email         String    @unique
+  emailVerified DateTime?
+  image         String?
+  role          UserRole  @default(team_member)
+
+  accounts Account[]
+  sessions Session[]
+
+  createdCampaigns     Campaign[]           @relation("CampaignCreatedBy")
+  createdFeedbackLinks ClientFeedbackLink[] @relation("FeedbackLinkCreatedBy")
+  savedViews           SavedView[]
+  blockedCreators      Creator[]            @relation("CreatorBlockedBy")
+  unblockedCreators    Creator[]            @relation("CreatorUnblockedBy")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model VerificationToken {
+  identifier String
+  token      String
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// ---------------------------------------------------------------------------
+// Client
+// ---------------------------------------------------------------------------
+
+model Client {
+  id           String  @id @default(cuid())
+  name         String
+  contactName  String?
+  contactEmail String?
+
+  standingContentGuidelines String?
+
+  campaigns                 Campaign[]
+  affiliatePrograms         AffiliateProgram[]
+  contentGuidelineTemplates ContentGuidelineTemplate[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Creator — globally reusable across campaigns. Deduplicate via provider ID
+// or platform+handle at the service layer (never create duplicates on re-discovery).
+// ---------------------------------------------------------------------------
+
+model Creator {
+  id    String  @id @default(cuid())
+  name  String
+  email String?
+
+  socialHandles Json @default("{}")
+
+  instagramHandle String?
+  tiktokHandle    String?
+  youtubeHandle   String?
+
+  instagramFollowers Int?
+  tiktokFollowers    Int?
+  youtubeFollowers   Int?
+
+  instagramEngagementRate Float?
+  tiktokEngagementRate    Float?
+  youtubeEngagementRate   Float?
+
+  credibilityScore Float?
+
+  /// Not in the original DB model list, but the Creator Profile spec
+  /// explicitly requires "average likes, average views" — added here.
+  averageLikes Int?
+  averageViews Int?
+
+  location String?
+  age      Int?
+  gender   String?
+
+  interests            Json @default("[]")
+  brandAffinities      Json @default("[]")
+  audienceDemographics Json @default("{}")
+  exampleContent       Json @default("[]")
+  verticalTags         Json @default("[]")
+
+  dataProviderName       String?
+  dataProviderExternalId String?
+  dataLastRefreshedAt    DateTime?
+
+  // Content safety — excluded by default from search/AI/directory/suggestions
+  // unless an authorized admin sets contentFlagOverride = true (logged to ActivityLog).
+  contentFlagged      Boolean  @default(false)
+  contentFlagOverride Boolean?
+
+  globalEligibilityStatus GlobalEligibilityStatus @default(eligible_for_future_campaigns)
+  globalBlockReason       GlobalBlockReason?
+  globalBlockNotes        String?
+
+  blockedById String?
+  blockedBy   User?     @relation("CreatorBlockedBy", fields: [blockedById], references: [id])
+  blockedAt   DateTime?
+
+  unblockedById String?
+  unblockedBy   User?     @relation("CreatorUnblockedBy", fields: [unblockedById], references: [id])
+  unblockedAt   DateTime?
+
+  campaignCreators CampaignCreator[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([dataProviderName, dataProviderExternalId])
+  @@unique([instagramHandle])
+  @@unique([tiktokHandle])
+  @@unique([youtubeHandle])
+  @@index([globalEligibilityStatus])
+  @@index([contentFlagged])
+}
+
+// ---------------------------------------------------------------------------
+// Campaign
+// ---------------------------------------------------------------------------
+
+model Campaign {
+  id       String @id @default(cuid())
+  clientId String
+  client   Client @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  name   String
+  status CampaignStatus @default(draft)
+
+  product String?
+
+  platforms               Json @default("[]")
+  nicheKeywords           Json @default("[]")
+  targetCreatorLocations  Json @default("[]")
+  targetAudienceLocations Json @default("[]")
+  audienceDemographics    Json @default("{}")
+
+  followerSizeMin Int?
+  followerSizeMax Int?
+
+  contentStyle String?
+  deliverables String?
+
+  defaultCompensationType CompensationType?
+  usageRightsExpectations String?
+  excludedContentTypes    Json              @default("[]")
+
+  defaultAffiliateProgramId String?
+  defaultAffiliateProgram   AffiliateProgram? @relation(fields: [defaultAffiliateProgramId], references: [id])
+
+  // { "showPricing": boolean } — governs whether /feedback/[token] displays compensation.
+  clientFeedbackDisplaySettings Json @default("{\"showPricing\": false}")
+
+  contentGuidelineTemplateId String?
+  contentGuidelineTemplate   ContentGuidelineTemplate? @relation(fields: [contentGuidelineTemplateId], references: [id])
+
+  startDate DateTime?
+  endDate   DateTime?
+
+  createdById String
+  createdBy   User   @relation("CampaignCreatedBy", fields: [createdById], references: [id])
+
+  campaignCreators CampaignCreator[]
+  feedbackLinks    ClientFeedbackLink[]
+  savedViews       SavedView[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([clientId])
+}
+
+// ---------------------------------------------------------------------------
+// CampaignCreator — one row per Creator per Campaign. The workflow spine.
+// ---------------------------------------------------------------------------
+
+model CampaignCreator {
+  id         String   @id @default(cuid())
+  campaignId String
+  campaign   Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  creatorId  String
+  creator    Creator  @relation(fields: [creatorId], references: [id])
+
+  workflowStatus   WorkflowStatus   @default(sourced)
+  campaignDecision CampaignDecision @default(keep_pending)
+
+  favorite       Boolean @default(false)
+  declinedReason String?
+
+  /// Categorical AI fit tier (strong_match / partial_match / poor_match) per
+  /// the AI Fit Scoring spec — field kept as "aiFitScore" per the data model,
+  /// though the value is a tier, not a numeric score.
+  aiFitScore       AIFitTier?
+  aiFitExplanation String?
+
+  teamNotes String?
+
+  compensationType CompensationType @default(gifting_only)
+
+  flatFeeAmount        Decimal?              @db.Decimal(12, 2)
+  flatFeePaymentStatus FlatFeePaymentStatus?
+
+  usageRightsGranted  UsageRightsGranted @default(negotiable)
+  usageRightsDuration String?
+  usageRightsFee      Decimal?           @db.Decimal(12, 2)
+
+  exclusivity String?
+
+  conversionRate Float?
+  gmv            Decimal? @db.Decimal(12, 2)
+
+  sourcedAt DateTime  @default(now())
+  decidedAt DateTime?
+
+  /// Sourcing outreach pitch (client feedback: "email template with generic
+  /// or custom pitch") — separate from the affiliate invite email, sent when
+  /// a creator is first added to a campaign, before any decision.
+  pitchMessage     String?
+  pitchEmailSentAt DateTime?
+  pitchEmailStatus InviteEmailStatus?
+
+  /// Post-enrollment content tracking (client feedback: "pending content and
+  /// active content") — null until the creator reaches an accepted state.
+  contentStatus ContentStatus?
+
+  clientPreferences    ClientPreference[]
+  affiliateEnrollments AffiliateEnrollment[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([campaignId, creatorId])
+  @@index([creatorId])
+  @@index([campaignId, workflowStatus])
+}
+
+enum ContentStatus {
+  pending_content
+  active_content
+}
+
+enum AIFitTier {
+  strong_match
+  partial_match
+  poor_match
+}
+
+// ---------------------------------------------------------------------------
+// ClientPreference — one per reviewer per CampaignCreator. Never authoritative.
+// ---------------------------------------------------------------------------
+
+model ClientPreference {
+  id                String          @id @default(cuid())
+  campaignCreatorId String
+  campaignCreator   CampaignCreator @relation(fields: [campaignCreatorId], references: [id], onDelete: Cascade)
+
+  reviewerName  String
+  reviewerEmail String?
+  preference    ClientPreferenceValue
+  comment       String?
+
+  submittedAt DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([campaignCreatorId])
+}
+
+// ---------------------------------------------------------------------------
+// AffiliateProgram — client-level network configuration
+// ---------------------------------------------------------------------------
+
+model AffiliateProgram {
+  id       String @id @default(cuid())
+  clientId String
+  client   Client @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  network           AffiliateNetwork
+  programName       String
+  externalProgramId String?
+
+  /// AES-256-GCM ciphertext (iv + authTag + ciphertext packed) — see src/lib/encryption.ts.
+  credentials Bytes?
+
+  active Boolean @default(true)
+
+  campaigns Campaign[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([clientId])
+}
+
+// ---------------------------------------------------------------------------
+// AffiliateEnrollment
+// ---------------------------------------------------------------------------
+
+model AffiliateEnrollment {
+  id                String          @id @default(cuid())
+  campaignCreatorId String
+  campaignCreator   CampaignCreator @relation(fields: [campaignCreatorId], references: [id], onDelete: Cascade)
+
+  network          AffiliateNetwork
+  networkProgramId String?
+
+  /// The network's own reference for this specific enrollment — needed to
+  /// look up status/tracking/performance later. Not in the original DB
+  /// model list; added because a real integration cannot function without it.
+  externalEnrollmentRef String?
+
+  enrollmentStatus AffiliateEnrollmentStatus @default(invite_created)
+
+  inviteLink   String?
+  trackingLink String?
+
+  hubspotContactId  String?
+  inviteEmailSentAt DateTime?
+  inviteEmailStatus InviteEmailStatus?
+
+  /// Public, token-based creator onboarding landing page (client feedback:
+  /// "join a sign up link for creator") — the invite email links here rather
+  /// than straight to the network's own signup URL, so we can show campaign
+  /// context first and track whether the creator actually engaged.
+  onboardingToken       String?   @unique
+  onboardingViewedAt    DateTime?
+  onboardingConfirmedAt DateTime?
+
+  appliedAt  DateTime?
+  enrolledAt DateTime?
+
+  /// Opaque status string from the affiliate network's own vocabulary — the
+  /// network remains the source of truth for payouts, we only mirror it.
+  payoutStatus String?
+
+  lastSyncedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([campaignCreatorId])
+}
+
+// ---------------------------------------------------------------------------
+// ClientFeedbackLink — public, token-based, no login
+// ---------------------------------------------------------------------------
+
+model ClientFeedbackLink {
+  id         String   @id @default(cuid())
+  campaignId String
+  campaign   Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  token String @unique
+
+  createdAt DateTime  @default(now())
+  expiresAt DateTime
+  revokedAt DateTime?
+
+  createdById String
+  createdBy   User   @relation("FeedbackLinkCreatedBy", fields: [createdById], references: [id])
+
+  @@index([campaignId])
+}
+
+// ---------------------------------------------------------------------------
+// ContentGuidelineTemplate — clientId null = Group 8A global template
+// ---------------------------------------------------------------------------
+
+model ContentGuidelineTemplate {
+  id       String  @id @default(cuid())
+  clientId String?
+  client   Client? @relation(fields: [clientId], references: [id], onDelete: SetNull)
+
+  name  String
+  rules Json   @default("[]")
+
+  campaigns Campaign[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([clientId])
+}
+
+// ---------------------------------------------------------------------------
+// SavedView — belongs to an individual user
+// ---------------------------------------------------------------------------
+
+model SavedView {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  name String
+
+  columnConfig Json @default("[]")
+  sortConfig   Json @default("[]")
+  filterConfig Json @default("{}")
+
+  pageScope SavedViewPageScope
+
+  campaignId String?
+  campaign   Campaign? @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@index([campaignId])
+}
+
+// ---------------------------------------------------------------------------
+// ActivityLog — polymorphic by design (entityType + entityId), no hard FK
+// ---------------------------------------------------------------------------
+
+model ActivityLog {
+  id String @id @default(cuid())
+
+  entityType String
+  entityId   String
+
+  actorType ActivityActorType
+  actorId   String?
+  actorName String?
+
+  action String
+  detail Json   @default("{}")
+
+  createdAt DateTime @default(now())
+
+  @@index([entityType, entityId])
+  @@index([createdAt])
+}
